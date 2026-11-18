@@ -2,11 +2,10 @@
 
 Este guia documenta como executar localmente uma arquitetura assíncrona orientada a eventos utilizando o **AWS Emulator** em Docker, integrando **Amazon S3**, **Amazon SQS** (com **Dead Letter Queue**), **Amazon DynamoDB** e um **Worker Python**.
 
----
-
 ## 1. Desenho da Arquitetura
 
 ### Diagrama de Fluxo (Mermaid)
+
 ```mermaid
 flowchart LR
     Client([Cliente / Upload]) -->|1. PutObject| S3In[(Amazon S3\nuploads-entrada)]
@@ -19,6 +18,7 @@ flowchart LR
 ```
 
 ### Diagrama ASCII
+
 ```text
   [1. Cliente / Upload] 
            │ (PutObject)
@@ -44,16 +44,16 @@ flowchart LR
 └───────────────┘                                  └───────────────┘
 ```
 
----
-
 ## 2. Como Executar Localmente
 
 ### Pré-requisitos
+
 * **Docker** instalado e em execução.
 * **AWS CLI v2** instalado na máquina host.
-* **Python 3** com `boto3` instalado (`pip install boto3`).
+* **Python 3** com suporte a ambientes virtuais (`python3-venv` e `python3-pip`).
 
 ### Passo 1: Construir e Subir o AWS Emulator (Terminal 1)
+
 *(Nota: Em sessões Live USB/CD como Linux Mint Live, configure `"storage-driver": "vfs"` em `/etc/docker/daemon.json` antes do build).*
 
 ```bash
@@ -72,11 +72,11 @@ sudo docker run --rm --memory=2g --memory-swap=2g \
   -v "$HOME/.aws/emulator:$HOME/.aws/emulator" \
   aws-emulator -p $PORT
 ```
+
 > Mantenha o **Terminal 1** aberto. Todos os recursos ficam em memória RAM e são apagados ao parar o contêiner (`Ctrl+C`).
 
----
-
 ### Passo 2: Provisionar a Infraestrutura AWS Local (Terminal 2)
+
 Abra um **segundo terminal**, aponte o AWS CLI para as credenciais geradas pelo emulador e crie os recursos:
 
 ```bash
@@ -115,20 +115,32 @@ aws s3api put-bucket-notification-configuration \
   --notification-configuration "{\"QueueConfigurations\":[{\"QueueArn\":\"$QUEUE_ARN\",\"Events\":[\"s3:ObjectCreated:*\"]}]}"
 ```
 
----
+### Passo 3: Configurar o Ambiente Virtual (`.venv`) e Iniciar o Worker (Terminal 2)
 
-### Passo 3: Iniciar o Worker (Terminal 2)
-No mesmo terminal onde as variáveis `AWS_*` estão configuradas, inicie o consumidor:
+No mesmo terminal onde as variáveis `AWS_*` estão configuradas, crie o ambiente virtual Python, instale o `boto3` e inicie o consumidor:
 
 ```bash
+# 1. Instalar dependências de ambiente virtual (caso não estejam instaladas no sistema)
+sudo apt-get update && sudo apt-get install -y python3-venv python3-pip
+
+# 2. Criar e ativar o ambiente virtual (.venv)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. Instalar o SDK boto3 dentro do (.venv)
+pip install boto3
+
+# 4. Executar o Worker
 python3 worker.py
 ```
+
+*(Nota: Sempre que abrir um novo terminal para rodar o Worker posteriormente, ative o ambiente antes com `source .venv/bin/activate`).*
+
 **Saída esperada:**
+
 ```text
 [*] Worker iniciado. Escutando fila: https://127.0.0.1:9297/.../fila-processamento
 ```
-
----
 
 ## 3. Cenários de Validação
 
@@ -140,73 +152,95 @@ export AWS_SHARED_CREDENTIALS_FILE=~/.aws/emulator/9297/emulator_credentials
 ```
 
 ### Cenário 1: Fluxo Completo (Upload → Evento S3 → SQS → Worker → DynamoDB/S3)
+
 Valida o processamento assíncrono de ponta a ponta em condições normais.
 
 1. **Disparar evento fazendo upload de um arquivo:**
+
    ```bash
    echo "relatorio financeiro consolidado 2026" > relatorio.txt
    aws s3 cp relatorio.txt s3://uploads-entrada/relatorio.txt
    ```
+
 2. **Validar no Terminal do Worker:**
    Observe os logs confirmando o recebimento e a conclusão:
+
    ```text
    [->] Novo evento recebido: s3://uploads-entrada/relatorio.txt
    [OK] Concluído: s3://resultados-saida/processado-relatorio.txt
    ```
+
 3. **Validar o artefato gerado no Bucket de Saída:**
+
    ```bash
    aws s3 cp s3://resultados-saida/processado-relatorio.txt -
    ```
+
 4. **Validar o estado persistido no DynamoDB:**
+
    ```bash
    aws dynamodb scan --table-name jobs-status
    ```
+
    *(Confirme que o item `relatorio.txt` possui `"status": {"S": "CONCLUIDO"}`).*
 
----
-
 ### Cenário 2: Desacoplamento e Retenção em Fila (Worker Offline)
+
 Valida que os eventos não são perdidos quando o serviço consumidor está fora do ar ou em manutenção.
 
 1. **Interromper o Worker:** No Terminal 2, pressione `Ctrl+C` para parar o `worker.py`.
+
 2. **Enviar múltiplos arquivos enquanto o consumidor está offline:**
+
    ```bash
    echo "pedido 001" > pedido1.txt
    echo "pedido 002" > pedido2.txt
    aws s3 cp pedido1.txt s3://uploads-entrada/pedido1.txt
    aws s3 cp pedido2.txt s3://uploads-entrada/pedido2.txt
    ```
+
 3. **Verificar o acúmulo de mensagens na fila SQS:**
+
    ```bash
    QUEUE_URL=$(aws sqs get-queue-url --queue-name fila-processamento --query 'QueueUrl' --output text)
    aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names ApproximateNumberOfMessages
    ```
-   *(O valor retornado será `"ApproximateNumberOfMessages": "2"`).*
-4. **Religar o Worker e confirmar o dreno da fila:**
-   Execute `python3 worker.py` novamente no Terminal 2. Ambos os arquivos serão processados imediatamente em sequência.
 
----
+   *(O valor retornado será `"ApproximateNumberOfMessages": "2"`).*
+
+4. **Religar o Worker (com `.venv` ativo) e confirmar o dreno da fila:**
+   No Terminal 2, execute:
+   ```bash
+   source .venv/bin/activate
+   python3 worker.py
+   ```
+   Ambos os arquivos serão processados imediatamente em sequência.
 
 ### Cenário 3: Resiliência e Isolamento de Falhas (Dead Letter Queue)
-Valida o comportamento do sistema quando um arquivo inválido provoca erro no processamento, garantindo que mensagens defeituosas não travem a fila principal.
+
+Valida o comportamento do sistema quando um arquivo inválido provoca erro no processamento, garantindo que mensagens defeituosas não travem a fila principal nem derrubem o processo do Worker.
 
 1. **Enviar um arquivo binário inválido (que causará erro de decodificação UTF-8 no Worker):**
+
    ```bash
    dd if=/dev/urandom of=arquivo-corrompido.txt bs=64 count=1
    aws s3 cp arquivo-corrompido.txt s3://uploads-entrada/arquivo-corrompido.txt
    ```
-2. **Acompanhar as retentativas:**
-   No Terminal 2, o Worker lançará uma exceção `UnicodeDecodeError` e não chamará `delete_message`. Após o *Visibility Timeout* da fila expirar 3 vezes (`maxReceiveCount: 3`), o SQS moverá a mensagem automaticamente para a DLQ.
+
+2. **Acompanhar as retentativas no Terminal 2:**
+   O Worker capturará a exceção `UnicodeDecodeError`, registrará o status `ERRO` no DynamoDB e manterá o processo ativo sem chamar `delete_message`. Após o *Visibility Timeout* da fila expirar 3 vezes (`maxReceiveCount: 3`), o SQS moverá a mensagem automaticamente para a DLQ.
+
 3. **Verificar a mensagem isolada na DLQ:**
+
    ```bash
    DLQ_URL=$(aws sqs get-queue-url --queue-name fila-dlq --query 'QueueUrl' --output text)
    aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names ApproximateNumberOfMessages
    ```
+
    *(O contador da `fila-dlq` passará para `"1"`, enquanto a `fila-processamento` voltará a `"0"`).*
 
----
-
 ## 4. Referências
+
 * [Documentação Oficial: AWS Emulator User Guide](https://docs.aws.amazon.com/emulator/latest/userguide/what-is-emulator.html)
 * [Guia Oficial: Getting Started with Docker (AWS Emulator)](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-docker.html)
 * [Amazon S3 Event Notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)

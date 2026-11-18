@@ -34,48 +34,61 @@ while True:
             sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt_handle)
             continue
 
-        for registro in corpo.get("Records", []):
-            bucket_origem = registro["s3"]["bucket"]["name"]
-            chave_arquivo = registro["s3"]["object"]["key"]
+        try:
+            for registro in corpo.get("Records", []):
+                bucket_origem = registro["s3"]["bucket"]["name"]
+                chave_arquivo = registro["s3"]["object"]["key"]
 
-            print(f"[->] Novo evento recebido: s3://{bucket_origem}/{chave_arquivo}")
+                print(f"[->] Novo evento recebido: s3://{bucket_origem}/{chave_arquivo}")
 
-            # 1. Marca como PROCESSANDO no DynamoDB
-            tabela_jobs.put_item(Item={
-                "arquivo_id": chave_arquivo,
-                "status": "PROCESSANDO",
-                "atualizado_em": datetime.now(timezone.utc).isoformat()
-            })
+                # 1. Marca como PROCESSANDO no DynamoDB
+                tabela_jobs.put_item(Item={
+                    "arquivo_id": chave_arquivo,
+                    "status": "PROCESSANDO",
+                    "atualizado_em": datetime.now(timezone.utc).isoformat()
+                })
 
-            # 2. Baixa arquivo original do S3
-            obj = s3.get_object(Bucket=bucket_origem, Key=chave_arquivo)
-            conteudo = obj["Body"].read().decode("utf-8")
+                # 2. Baixa arquivo original do S3
+                obj = s3.get_object(Bucket=bucket_origem, Key=chave_arquivo)
+                conteudo = obj["Body"].read().decode("utf-8")
 
-            # 3. Processamento simulado
-            resultado = (
-                f"PROCESSADO EM: {datetime.now(timezone.utc).isoformat()}\n"
-                f"TOTAL DE CARACTERES: {len(conteudo)}\n"
-                f"{'-' * 40}\n"
-                f"{conteudo.upper()}"
-            )
+                # 3. Processamento simulado
+                resultado = (
+                    f"PROCESSADO EM: {datetime.now(timezone.utc).isoformat()}\n"
+                    f"TOTAL DE CARACTERES: {len(conteudo)}\n"
+                    f"{'-' * 40}\n"
+                    f"{conteudo.upper()}"
+                )
 
-            # 4. Grava artefato processado no bucket de saída
-            chave_saida = f"processado-{chave_arquivo}"
-            s3.put_object(
-                Bucket="resultados-saida",
-                Key=chave_saida,
-                Body=resultado.encode("utf-8")
-            )
+                # 4. Grava artefato processado no bucket de saída
+                chave_saida = f"processado-{chave_arquivo}"
+                s3.put_object(
+                    Bucket="resultados-saida",
+                    Key=chave_saida,
+                    Body=resultado.encode("utf-8")
+                )
 
-            # 5. Marca como CONCLUIDO no DynamoDB
-            tabela_jobs.put_item(Item={
-                "arquivo_id": chave_arquivo,
-                "status": "CONCLUIDO",
-                "arquivo_saida": f"s3://resultados-saida/{chave_saida}",
-                "atualizado_em": datetime.now(timezone.utc).isoformat()
-            })
+                # 5. Marca como CONCLUIDO no DynamoDB
+                tabela_jobs.put_item(Item={
+                    "arquivo_id": chave_arquivo,
+                    "status": "CONCLUIDO",
+                    "arquivo_saida": f"s3://resultados-saida/{chave_saida}",
+                    "atualizado_em": datetime.now(timezone.utc).isoformat()
+                })
 
-            print(f"[OK] Concluído: s3://resultados-saida/{chave_saida}")
+                print(f"[OK] Concluído: s3://resultados-saida/{chave_saida}")
 
-        # 6. Confirma consumo da mensagem na fila
-        sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt_handle)
+            # 6. Confirma consumo da mensagem na fila apenas se tudo deu certo
+            sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt_handle)
+
+        except Exception as erro:
+            print(f"[ERRO] Falha ao processar mensagem: {erro}")
+            print("[!] Mensagem mantida na fila para retentativa/DLQ.")
+            # Registra a falha no DynamoDB se soubermos qual era o arquivo
+            if "chave_arquivo" in locals():
+                tabela_jobs.put_item(Item={
+                    "arquivo_id": chave_arquivo,
+                    "status": "ERRO",
+                    "detalhe_erro": str(erro),
+                    "atualizado_em": datetime.now(timezone.utc).isoformat()
+                })
